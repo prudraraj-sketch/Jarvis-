@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build and verify Android release APK
+    name: Build and verify signed Android release APK
     runs-on: ubuntu-latest
     timeout-minutes: 50
     env:
@@ -47,27 +47,28 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      - name: Check signing configuration
+      - name: Require persistent release signing secrets
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "${RELEASE_KEYSTORE_BASE64:-}" ]]; then
-            test -n "${RELEASE_STORE_PASSWORD:-}"
-            test -n "${RELEASE_KEY_ALIAS:-}"
-            test -n "${RELEASE_KEY_PASSWORD:-}"
-            echo "Production signing secrets detected."
-          else
-            echo "::warning::No persistent release key configured. The APK will be signed with the runner debug key for sideload testing only. Do not publish this build to Google Play."
-          fi
+          for secret_name in RELEASE_KEYSTORE_BASE64 RELEASE_STORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "::error::Missing required GitHub Actions secret: $secret_name"
+              exit 1
+            fi
+          done
+          echo "All persistent release-signing secrets are configured."
 
-      - name: Restore private release signing key
-        if: ${{ env.RELEASE_KEYSTORE_BASE64 != '' }}
+      - name: Restore and verify private release signing key
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/gesturecontrol-release.jks"
-          chmod 600 "$RUNNER_TEMP/gesturecontrol-release.jks"
-          echo "RELEASE_KEYSTORE_FILE=$RUNNER_TEMP/gesturecontrol-release.jks" >> "$GITHUB_ENV"
+          KEYSTORE="$RUNNER_TEMP/gesturecontrol-release.jks"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          chmod 600 "$KEYSTORE"
+          keytool -list -keystore "$KEYSTORE" -storepass "$RELEASE_STORE_PASSWORD" -alias "$RELEASE_KEY_ALIAS" >/dev/null
+          echo "RELEASE_KEYSTORE_FILE=$KEYSTORE" >> "$GITHUB_ENV"
+          echo "Private release keystore restored and alias verified."
 
       - name: Verify project and download pinned model
         shell: bash
@@ -83,7 +84,7 @@ jobs:
       - name: Build non-debuggable release APK
         run: gradle assembleRelease --no-daemon
 
-      - name: Verify APK signature, debuggability and permissions
+      - name: Verify APK signature, signing identity, debuggability and permissions
         shell: bash
         run: |
           set -euo pipefail
@@ -95,7 +96,13 @@ jobs:
           test -x "$APKSIGNER"
           test -x "$APKANALYZER"
 
-          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee "$RUNNER_TEMP/apk-signature.txt"
+          ACTUAL_CERT_SHA256="$(keytool -list -v -keystore "$RELEASE_KEYSTORE_FILE" -storepass "$RELEASE_STORE_PASSWORD" -alias "$RELEASE_KEY_ALIAS" | awk '/SHA256:/{gsub(":","",$2); print toupper($2); exit}')"
+          APK_CERT_SHA256="$(awk -F': ' '/certificate SHA-256 digest:/{gsub(":","",$2); print toupper($2); exit}' "$RUNNER_TEMP/apk-signature.txt")"
+          if [[ -z "$ACTUAL_CERT_SHA256" || "$ACTUAL_CERT_SHA256" != "$APK_CERT_SHA256" ]]; then
+            echo "APK was not signed by the configured persistent release certificate." >&2
+            exit 1
+          fi
 
           DEBUGGABLE="$("$APKANALYZER" manifest debuggable "$APK")"
           if [[ "$DEBUGGABLE" != "false" ]]; then
@@ -143,14 +150,11 @@ jobs:
           {
             echo '## GestureControl release build'
             echo '- Build result: SUCCESS'
+            echo '- Signing: persistent private release key'
+            echo '- Signing certificate: matched to configured keystore'
             echo '- Android target: API 36'
             echo '- APK debuggable: false'
             echo '- INTERNET permission: absent'
             echo '- APK signature: verified'
             echo '- Artifact retention: 30 days'
-            if [[ -n "${RELEASE_KEYSTORE_BASE64:-}" ]]; then
-              echo '- Signing: configured private release key'
-            else
-              echo '- Signing: temporary runner debug key (sideload testing only)'
-            fi
           } >> "$GITHUB_STEP_SUMMARY"
