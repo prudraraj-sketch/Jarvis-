@@ -33,12 +33,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android 16 SDK and build tools
+        shell: bash
         run: |
-          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          set -euo pipefail
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
 
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
@@ -88,15 +88,20 @@ jobs:
           APK="app/build/outputs/apk/release/app-release.apk"
           test -s "$APK"
 
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          APKANALYZER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name apkanalyzer | sort -V | tail -n 1)"
+          test -x "$APKSIGNER"
+          test -x "$APKANALYZER"
 
-          DEBUGGABLE="$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest debuggable "$APK")"
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+
+          DEBUGGABLE="$("$APKANALYZER" manifest debuggable "$APK")"
           if [[ "$DEBUGGABLE" != "false" ]]; then
             echo "Release APK must not be debuggable (got: $DEBUGGABLE)." >&2
             exit 1
           fi
 
-          PERMISSIONS="$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest permissions "$APK")"
+          PERMISSIONS="$("$APKANALYZER" manifest permissions "$APK")"
           if grep -q "android.permission.INTERNET" <<< "$PERMISSIONS"; then
             echo "Unexpected INTERNET permission found in final APK." >&2
             exit 1
