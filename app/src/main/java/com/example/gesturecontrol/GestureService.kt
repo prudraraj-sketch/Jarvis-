@@ -1,10 +1,13 @@
 package com.example.gesturecontrol
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Matrix
@@ -22,32 +25,28 @@ import androidx.lifecycle.LifecycleService
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.facedetector.FaceDetector
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * Foreground service: front camera -> MediaPipe hand + face models (bundled in assets, offline)
- * -> gesture classifier -> accessibility actions.
+ * Camera foreground service. Frames are analysed locally for hand landmarks only.
+ * No frames or landmarks are saved or transmitted.
  */
 class GestureService : LifecycleService() {
 
     companion object {
         private const val TAG = "GestureService"
         private const val CHANNEL_ID = "gesture_control"
-        private const val FACE_GRACE_MS = 1500L
         private const val HAND_MODEL = "hand_landmarker.task"
-        private const val FACE_MODEL = "blaze_face_short_range.tflite"
+        private const val ACTION_STOP = "com.example.gesturecontrol.action.STOP"
     }
 
     private lateinit var cameraExecutor: ExecutorService
     private var hand: HandLandmarker? = null
-    private var face: FaceDetector? = null
-    private var cameraBound = false
-
-    @Volatile
-    private var lastFaceSeenAt = 0L
+    private var cameraProvider: ProcessCameraProvider? = null
+    @Volatile private var cameraBinding = false
+    @Volatile private var isStopping = false
 
     private val classifier = GestureClassifier { gesture -> handleGesture(gesture) }
 
@@ -59,32 +58,50 @@ class GestureService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        if (!cameraBound) {
+
+        if (intent?.action == ACTION_STOP) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (!GestureConsent.hasAccessibilityConsent(this)) {
+            GestureState.lastGesture.value = "Start blocked: consent not granted"
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            GestureState.lastGesture.value = "Start blocked: camera permission missing"
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (hand == null && !cameraBinding) {
             try {
-                createModels()
+                createHandModel()
                 bindCamera()
-                cameraBound = true
-                GestureState.running.value = true
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to start. Are the model files in app/src/main/assets?", e)
-                GestureState.lastGesture.value = "Error: ${e.message}"
+                Log.e(TAG, "Unable to initialise hand detection", e)
+                GestureState.lastGesture.value = "Startup error: " + (e.message ?: "unknown error")
                 stopSelf()
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        isStopping = true
         GestureState.running.value = false
-        GestureState.faceVisible.value = false
-        ProcessCameraProvider.getInstance(this).get().unbindAll()
+        cameraProvider?.unbindAll()
         hand?.close()
-        face?.close()
-        cameraExecutor.shutdown()
+        hand = null
+        cameraExecutor.shutdownNow()
         super.onDestroy()
     }
 
-    private fun createModels() {
+    private fun createHandModel() {
         hand = HandLandmarker.createFromOptions(
             this,
             HandLandmarker.HandLandmarkerOptions.builder()
@@ -94,6 +111,7 @@ class GestureService : LifecycleService() {
                 .setMinHandDetectionConfidence(0.6f)
                 .setMinTrackingConfidence(0.5f)
                 .setResultListener { result, _ ->
+                    if (isStopping) return@setResultListener
                     val landmarks = result.landmarks().firstOrNull()
                     if (landmarks == null || landmarks.size < 21) {
                         classifier.onNoHand()
@@ -101,87 +119,100 @@ class GestureService : LifecycleService() {
                         classifier.onHand(landmarks, SystemClock.uptimeMillis())
                     }
                 }
-                .setErrorListener { Log.e(TAG, "Hand error", it) }
-                .build()
-        )
-
-        face = FaceDetector.createFromOptions(
-            this,
-            FaceDetector.FaceDetectorOptions.builder()
-                .setBaseOptions(BaseOptions.builder().setModelAssetPath(FACE_MODEL).build())
-                .setRunningMode(RunningMode.LIVE_STREAM)
-                .setMinDetectionConfidence(0.6f)
-                .setResultListener { result, _ ->
-                    val seen = result.detections().any {
-                        (it.categories().firstOrNull()?.score() ?: 0f) >= 0.6f
-                    }
-                    if (seen) lastFaceSeenAt = SystemClock.uptimeMillis()
-                    GestureState.faceVisible.value = seen
-                }
-                .setErrorListener { Log.e(TAG, "Face error", it) }
+                .setErrorListener { Log.e(TAG, "Hand landmark error", it) }
                 .build()
         )
     }
 
     private fun bindCamera() {
+        cameraBinding = true
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
-            val provider = providerFuture.get()
-            val analysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(480, 360))
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-            analysis.setAnalyzer(cameraExecutor) { proxy -> analyze(proxy) }
+            if (isStopping || !GestureConsent.hasAccessibilityConsent(this)) {
+                stopSelf()
+                return@addListener
+            }
 
-            provider.unbindAll()
-            provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+            try {
+                val provider = providerFuture.get()
+                cameraProvider = provider
+                val analysis = ImageAnalysis.Builder()
+                    .setTargetResolution(Size(480, 360))
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                    .build()
+
+                analysis.setAnalyzer(cameraExecutor) { proxy -> analyze(proxy) }
+                provider.unbindAll()
+                provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+                GestureState.running.value = true
+            } catch (e: Exception) {
+                Log.e(TAG, "Unable to bind the front camera", e)
+                GestureState.lastGesture.value = "Camera error: " + (e.message ?: "unavailable")
+                stopSelf()
+            }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun analyze(proxy: ImageProxy) {
         try {
-            val raw = proxy.toBitmap()
-            // Upright + mirrored, so "hand moves to my right" means x increases.
-            val matrix = Matrix().apply {
+            if (isStopping) return
+            val raw: Bitmap = proxy.toBitmap()
+            val transform = Matrix().apply {
                 postRotate(proxy.imageInfo.rotationDegrees.toFloat())
                 postScale(-1f, 1f)
             }
-            val bitmap = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
-            val image = BitmapImageBuilder(bitmap).build()
-            val ts = SystemClock.uptimeMillis()
-            hand?.detectAsync(image, ts)
-            face?.detectAsync(image, ts)
+            val uprightMirrored = Bitmap.createBitmap(
+                raw, 0, 0, raw.width, raw.height, transform, true
+            )
+            val image = BitmapImageBuilder(uprightMirrored).build()
+            hand?.detectAsync(image, SystemClock.uptimeMillis())
         } catch (e: Exception) {
-            Log.e(TAG, "Frame error", e)
+            Log.e(TAG, "Frame analysis failed", e)
         } finally {
             proxy.close()
         }
     }
 
     private fun handleGesture(gesture: Gesture) {
-        val now = SystemClock.uptimeMillis()
-        if (GestureState.faceLock && now - lastFaceSeenAt > FACE_GRACE_MS) {
-            GestureState.lastGesture.value = "$gesture ignored (no face)"
-            return
-        }
+        if (isStopping || !GestureConsent.hasAccessibilityConsent(this)) return
         GestureState.lastGesture.value = gesture.name
-        GestureAccessibilityService.instance?.perform(gesture)
-            ?: run { GestureState.lastGesture.value = "${gesture.name}: enable Accessibility service" }
+        val accessibility = GestureAccessibilityService.instance
+        if (accessibility == null) {
+            GestureState.lastGesture.value = gesture.name + ": enable Accessibility service"
+        } else {
+            accessibility.perform(gesture)
+        }
     }
 
     private fun startInForeground() {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Gesture detection", NotificationManager.IMPORTANCE_LOW)
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID,
+                    "Gesture detection",
+                    NotificationManager.IMPORTANCE_LOW
+                )
             )
         }
+
+        val stopIntent = Intent(this, GestureService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPendingIntent = PendingIntent.getService(
+            this,
+            100,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Gesture Control is running")
-            .setContentText("Front camera is on. Processing stays on this device.")
+            .setContentText("Front camera is analysing hand gestures on this device.")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
+            .addAction(android.R.drawable.ic_media_pause, "Stop", stopPendingIntent)
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
