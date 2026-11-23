@@ -1,0 +1,89 @@
+name: Build GestureControl APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gesturecontrol-apk-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Android debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Verify project files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f settings.gradle.kts
+          test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
+          test -f download_models.sh
+
+      - name: Download MediaPipe models
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash download_models.sh
+          test -s app/src/main/assets/hand_landmarker.task
+          test -s app/src/main/assets/blaze_face_short_range.tflite
+
+      - name: Build debug APK
+        shell: bash
+        run: gradle assembleDebug --no-daemon
+
+      - name: Validate and package APK
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          mkdir -p release
+          VERSION="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          cp "$APK" "release/GestureControl-${VERSION}.apk"
+          (cd release && sha256sum "GestureControl-${VERSION}.apk" > SHA256SUMS.txt)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$APK" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GestureControl-${{ steps.package.outputs.version }}
+          path: |
+            release/*.apk
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build summary
+        if: success()
+        run: |
+          {
+            echo '## GestureControl APK build'
+            echo '- Status: SUCCESS'
+            echo '- Version: ${{ steps.package.outputs.version }}'
+            echo '- APK size: ${{ steps.package.outputs.size }}'
+            echo '- Artifact retention: 30 days'
+          } >> "$GITHUB_STEP_SUMMARY"
