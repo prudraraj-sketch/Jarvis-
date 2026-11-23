@@ -42,14 +42,9 @@ android {
         release {
             isDebuggable = false
             isMinifyEnabled = false
-            // Prefer a persistent upload key supplied through Actions secrets.
-            // Without one, sign a non-debuggable sideload test build with the
-            // runner's standard debug key. That fallback is not Play Store signing.
-            signingConfig = if (hasProductionSigning) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            // Release builds must use the persistent private signing identity.
+            // The Actions workflow fails before building if signing secrets are absent.
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
