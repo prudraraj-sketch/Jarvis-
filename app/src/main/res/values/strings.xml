@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Gesture Control</string>
-    <string name="a11y_desc">Allows on-screen swipes, scrolling, Home and Back actions after the user performs a recognised hand gesture. Does not inspect screen or window content.</string>
+    <string name="gesture_service_accessibility_description">Allows on-screen swipes, scrolling, Home and Back actions after the user performs a recognised hand gesture. Does not inspect screen or window content.</string>
 </resources>
