@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Gesture Control</string>
-    <string name="a11y_desc">Lets Gesture Control perform swipes, scrolls, Home and Recents when it sees your hand gestures. Everything runs on this device.</string>
+    <string name="a11y_desc">Sends screen swipes and scroll gestures and performs Home or Back only in response to the user's recognised hand gestures. Does not retrieve screen or window content.</string>
 </resources>
